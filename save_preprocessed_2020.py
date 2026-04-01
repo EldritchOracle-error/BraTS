@@ -37,12 +37,19 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 
 
 def normalize(volume):
-    """Min-max normalise a single-channel 2D array to [0, 1]."""
-    min_val = volume.min()
-    max_val = volume.max()
-    if max_val - min_val == 0:
+    """
+    Percentile-clip then min-max normalise a 2D array to [0, 1].
+
+    Percentile clipping (1st–99th) prevents a single bright outlier voxel
+    from compressing all other values toward zero — common with z-score
+    pre-normalised MRI data like this BraTS-2020 H5 dataset.
+    """
+    p1  = np.percentile(volume, 1)
+    p99 = np.percentile(volume, 99)
+    volume = np.clip(volume, p1, p99)
+    if p99 - p1 == 0:
         return volume.astype(np.float32)
-    return ((volume - min_val) / (max_val - min_val)).astype(np.float32)
+    return ((volume - p1) / (p99 - p1)).astype(np.float32)
 
 
 def resize_2d(arr, target=128, order=1):
