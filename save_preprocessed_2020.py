@@ -1,166 +1,134 @@
 """
 save_preprocessed_2020.py
 
-Preprocesses the BraTS 2020 Training dataset and saves each non-empty
-axial slice as a pair of .npy files:
-    <patient_id>_slice<NNN>_img.npy   → shape (4, 128, 128) float32
-    <patient_id>_slice<NNN>_mask.npy  → shape (128, 128)    int64
+Preprocesses the BraTS 2020 H5 dataset.
 
-BraTS 2020 naming convention:
-    BraTS20_Training_001/
-        BraTS20_Training_001_flair.nii.gz
-        BraTS20_Training_001_t1.nii.gz
-        BraTS20_Training_001_t1ce.nii.gz
-        BraTS20_Training_001_t2.nii.gz
-        BraTS20_Training_001_seg.nii.gz   ← only in training split (369 patients)
+Each .h5 file is already one 2D axial slice containing:
+    'image'  → shape (240, 240, 4)  float64  — 4 modalities (flair, t1, t1ce, t2)
+    'mask'   → shape (240, 240, 3)  uint8    — one-hot across 3 tumour classes
 
-Label mapping (same as BraTS 2021):
-    0 → background
-    1 → necrotic core (NCR/NET)
-    2 → peritumoral edema (ED)
-    4 → enhancing tumor (ET)  ← remapped to 3
+One-hot mask channel mapping:
+    channel 0 → necrotic core        → label 1
+    channel 1 → peritumoral edema    → label 2
+    channel 2 → enhancing tumour     → label 3
+    all zeros → background           → label 0
 
-Run this script ONCE before training. It takes ~10-20 minutes.
+Output per non-empty slice:
+    brats20_<stem>_img.npy   → shape (4, 128, 128)  float32
+    brats20_<stem>_mask.npy  → shape (128, 128)     int64
+
+Run this script ONCE before training. It only takes a few minutes
+because the slicing is already done by the dataset provider.
 """
 
 import os
 import numpy as np
-import nibabel as nib
-nib.Nifti1Header.quaternion_threshold = -1e-6
+import h5py
 from scipy.ndimage import zoom
 from tqdm import tqdm
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-DATA_PATH = r"D:\\AI_in_Organ_Design\\datasets\\BraTS_2020\\extracted"
-SAVE_PATH = r"D:\\AI_in_Organ_Design\\datasets\\BraTS_combined\\preprocessed"
+DATA_PATH = r"D:\AI_in_Organ_Design\datasets\BraTS_2020\BraTS2020_training_data\content\data"
+SAVE_PATH = r"D:\AI_in_Organ_Design\datasets\BraTS_combined\preprocessed"
 IMG_SIZE  = 128
 # ──────────────────────────────────────────────────────────────────────────────
 
 os.makedirs(SAVE_PATH, exist_ok=True)
 
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
 def normalize(volume):
-    """Min-max normalise to [0, 1]. Returns unchanged volume if flat."""
-    min_val = np.min(volume)
-    max_val = np.max(volume)
+    """Min-max normalise a single-channel 2D array to [0, 1]."""
+    min_val = volume.min()
+    max_val = volume.max()
     if max_val - min_val == 0:
-        return volume
-    return (volume - min_val) / (max_val - min_val)
+        return volume.astype(np.float32)
+    return ((volume - min_val) / (max_val - min_val)).astype(np.float32)
 
 
-def resize_volume(volume, target_size=128):
-    """Resize H×W to target_size×target_size, preserving depth axis."""
-    h, w = volume.shape[:2]
-    scale_h = target_size / h
-    scale_w = target_size / w
-    if volume.ndim == 3:
-        return zoom(volume, (scale_h, scale_w, 1), order=1)
-    else:
-        return zoom(volume, (scale_h, scale_w), order=0)   # nearest for masks
+def resize_2d(arr, target=128, order=1):
+    """Resize a 2D array to target×target using scipy zoom."""
+    h, w = arr.shape
+    return zoom(arr, (target / h, target / w), order=order)
 
 
-def detect_suffix(folder, patient_id):
+def onehot_to_label(mask_onehot):
     """
-    BraTS 2020 datasets from different sources occasionally ship with either
-    no suffix or a '.gz' suffix only. This helper returns the correct full
-    filename for a modality so we are not hard-coded to one variant.
+    Convert a (H, W, 3) one-hot mask to a (H, W) integer label map.
+
+    Channel assignment:
+        0 → necrotic core     → label 1
+        1 → peritumoral edema → label 2
+        2 → enhancing tumour  → label 3
+        background (no channel active) → label 0
     """
-    for ext in [".nii.gz", ".nii"]:
-        candidate = os.path.join(folder, f"{patient_id}_flair{ext}")
-        if os.path.isfile(candidate):
-            return ext
-    return ".nii.gz"   # fall back to the standard
+    label_map = np.zeros(mask_onehot.shape[:2], dtype=np.int64)
+    # iterate in reverse priority so that in the rare case of overlap
+    # the lower-index (higher-priority) channel wins
+    for ch, label in [(2, 3), (1, 2), (0, 1)]:
+        label_map[mask_onehot[:, :, ch] > 0] = label
+    return label_map
 
 
-# ─── GATHER PATIENT FOLDERS ───────────────────────────────────────────────────
-all_folders = sorted([
-    os.path.join(DATA_PATH, f)
-    for f in os.listdir(DATA_PATH)
-    if os.path.isdir(os.path.join(DATA_PATH, f))
-])
+# ─── GATHER FILES ─────────────────────────────────────────────────────────────
+h5_files = sorted([f for f in os.listdir(DATA_PATH) if f.endswith(".h5")])
 
-# Keep only folders that have a segmentation file (training split only)
-valid_folders = []
-for folder in all_folders:
-    patient_id = os.path.basename(folder)
-    ext = detect_suffix(folder, patient_id)
-    seg_path = os.path.join(folder, f"{patient_id}_seg{ext}")
-    if os.path.isfile(seg_path):
-        valid_folders.append((folder, ext))
-
-print(f"Found {len(valid_folders)} BraTS-2020 patients with segmentation masks")
-print(f"Saving preprocessed slices to: {SAVE_PATH}")
-print("This only needs to run ONCE — it takes ~10-20 minutes.")
+print(f"Found {len(h5_files)} .h5 slice files")
+print(f"Saving to: {SAVE_PATH}")
 print("=" * 60)
 
-saved_count  = 0
-skipped_count = 0
+saved_count   = 0
+skipped_empty = 0
+skipped_error = 0
 
-for folder, ext in tqdm(valid_folders, desc="Processing BraTS-2020 patients"):
+for fname in tqdm(h5_files, desc="Processing BraTS-2020 slices"):
     try:
-        patient_id = os.path.basename(folder)
+        fpath = os.path.join(DATA_PATH, fname)
 
-        def load(mod):
-            return nib.load(
-                os.path.join(folder, f"{patient_id}_{mod}{ext}")
-            ).get_fdata()
+        with h5py.File(fpath, "r") as f:
+            image = f["image"][()]   # (240, 240, 4)  float64
+            mask  = f["mask"][()]    # (240, 240, 3)  uint8
 
-        flair = load("flair")
-        t1    = load("t1")
-        t1ce  = load("t1ce")
-        t2    = load("t2")
-        seg   = load("seg")
+        # Convert one-hot mask → integer label map (240, 240)
+        label_map = onehot_to_label(mask)
+
+        # Skip slices with no tumour annotation at all
+        if label_map.max() == 0:
+            skipped_empty += 1
+            continue
 
         # Normalise each modality independently
-        flair = normalize(flair)
-        t1    = normalize(t1)
-        t1ce  = normalize(t1ce)
-        t2    = normalize(t2)
+        channels = []
+        for c in range(image.shape[2]):          # 4 modalities
+            channels.append(normalize(image[:, :, c]))
 
-        # Resize spatial dims to IMG_SIZE × IMG_SIZE
-        flair = resize_volume(flair, IMG_SIZE)
-        t1    = resize_volume(t1,    IMG_SIZE)
-        t1ce  = resize_volume(t1ce,  IMG_SIZE)
-        t2    = resize_volume(t2,    IMG_SIZE)
-        seg   = resize_volume(seg,   IMG_SIZE)
+        # Resize each channel and the label map to IMG_SIZE × IMG_SIZE
+        channels_resized = [resize_2d(ch, IMG_SIZE, order=1) for ch in channels]
+        label_resized    = resize_2d(label_map.astype(np.float32), IMG_SIZE, order=0)
 
-        # Iterate over axial slices (axis=2)
-        for s in range(seg.shape[2]):
-            mask_slice = seg[:, :, s]
+        # Stack channels → (4, 128, 128) and round label back to int
+        img_slice  = np.stack(channels_resized, axis=0).astype(np.float32)
+        mask_slice = np.round(label_resized).astype(np.int64)
+        mask_slice = np.clip(mask_slice, 0, 3)
 
-            # Skip slices that contain no tumour annotation
-            if np.sum(mask_slice) == 0:
-                continue
+        # Use the h5 filename stem as the identifier
+        # e.g. volume_100_slice_0.h5 → brats20_volume_100_slice_0
+        stem   = os.path.splitext(fname)[0]          # "volume_100_slice_0"
+        prefix = f"brats20_{stem}"
 
-            # Stack modalities → (4, 128, 128) float32
-            img_slice = np.stack([
-                flair[:, :, s],
-                t1   [:, :, s],
-                t1ce [:, :, s],
-                t2   [:, :, s],
-            ], axis=0).astype(np.float32)
-
-            # Remap label 4 (enhancing tumour) → 3  (same convention as 2021)
-            mask_slice = np.where(mask_slice == 4, 3, mask_slice).astype(np.int64)
-
-            # Prefix with "brats20_" to avoid collisions with 2021 filenames
-            prefix = f"brats20_{patient_id}_slice{s:03d}"
-            np.save(os.path.join(SAVE_PATH, f"{prefix}_img.npy"),  img_slice)
-            np.save(os.path.join(SAVE_PATH, f"{prefix}_mask.npy"), mask_slice)
-            saved_count += 1
-
-        del flair, t1, t1ce, t2, seg
+        np.save(os.path.join(SAVE_PATH, f"{prefix}_img.npy"),  img_slice)
+        np.save(os.path.join(SAVE_PATH, f"{prefix}_mask.npy"), mask_slice)
+        saved_count += 1
 
     except Exception as e:
-        print(f"\nSkipping {folder}: {e}")
-        skipped_count += 1
+        print(f"\nSkipping {fname}: {e}")
+        skipped_error += 1
 
 print(f"\nDone!")
-print(f"  Slices saved : {saved_count}")
-print(f"  Patients skipped (errors): {skipped_count}")
-print(f"  Output folder: {SAVE_PATH}")
-print(
-    "\nNext step: copy (or symlink) your existing BraTS-2021 preprocessed "
-    "slices into the same folder, then point get_dataloaders() at it."
-)
+print(f"  Slices saved        : {saved_count}")
+print(f"  Skipped (empty)     : {skipped_empty}")
+print(f"  Skipped (error)     : {skipped_error}")
+print(f"  Output folder       : {SAVE_PATH}")
+print()
+print("Next steps:")
+print("  1. python copy_2021_to_combined.py   ← merge BraTS-2021 slices in")
+print("  2. python Train_Unet.py              ← train on the combined dataset")
